@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.deepeval/
+.deepeval_cache/
+*.egg-info/
+.idea/
+REVIEW.md

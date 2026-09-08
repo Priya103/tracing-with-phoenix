@@ -1,0 +1,27 @@
+[project]
+name = "tracing-with-phoenix"
+version = "0.1.0"
+description = "Movie recommender evaluated with DeepEval, instrumented with Arize Phoenix for LLM tracing."
+requires-python = ">=3.13.9"
+dependencies = [
+    "anthropic>=0.40.0",
+    "deepeval>=1.5.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["recommender*", "evaluation*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
