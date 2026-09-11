@@ -13,6 +13,18 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+tracing = [
+    "arize-phoenix-otel",                          # thin OTLP exporter wrapper
+    "arize-phoenix-client",                        # needed for log_span_annotations_dataframe
+    "openinference-instrumentation-anthropic",
+    "openinference-instrumentation-openai",
+    "pandas",                                       # dataframes for annotation upload
+]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "opentelemetry-instrumentation-fastapi",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -20,7 +32,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["recommender*", "evaluation*"]
+include = ["recommender*", "evaluation*", "tracing*", "server*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

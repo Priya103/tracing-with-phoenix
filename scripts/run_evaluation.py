@@ -32,6 +32,9 @@ from deepeval.test_case import LLMTestCase
 
 from evaluation import GOLDEN_DATASET, GoldenCase, metrics_for
 from recommender import MovieRecommender
+from tracing import annotations, eval_case_span, setup_tracing
+
+setup_tracing()
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,9 +45,17 @@ def parse_args() -> argparse.Namespace:
         help="Only run cases from this bucket.",
     )
     p.add_argument(
+        "--cases",
+        help=(
+            "Comma-separated list of case IDs to run (e.g. 'fail-04,fail-11,normal-15'). "
+            "Combines with --category as an AND filter. Order in the output matches the "
+            "order given here."
+        ),
+    )
+    p.add_argument(
         "--limit",
         type=int,
-        help="Only run the first N cases (after --category filter). Useful for smoke tests.",
+        help="Only run the first N cases (after --category/--cases filter). Useful for smoke tests.",
     )
     p.add_argument(
         "--json",
@@ -70,6 +81,14 @@ def run(args: argparse.Namespace) -> int:
     cases: list[GoldenCase] = list(GOLDEN_DATASET)
     if args.category:
         cases = [c for c in cases if c.category == args.category]
+    if args.cases:
+        wanted = [cid.strip() for cid in args.cases.split(",") if cid.strip()]
+        by_id = {c.id: c for c in cases}
+        missing = [cid for cid in wanted if cid not in by_id]
+        if missing:
+            print(f"Unknown case id(s): {', '.join(missing)}", file=sys.stderr)
+            return 2
+        cases = [by_id[cid] for cid in wanted]  # preserve caller order
     if args.limit:
         cases = cases[: args.limit]
 
@@ -80,19 +99,36 @@ def run(args: argparse.Namespace) -> int:
     print(f"Running {len(cases)} case(s) through the recommender...\n")
     recommender = MovieRecommender()
     per_case: list[tuple[GoldenCase, object]] = []
+    errored: list[tuple[GoldenCase, str]] = []
 
     for i, case in enumerate(cases, 1):
         print(f"  [{i:>3}/{len(cases)}] {case.id:<10} ({case.category})", flush=True)
-        rec = recommender.recommend(**case.inputs)
-        tc = LLMTestCase(input=rec.input, actual_output=rec.output)
-        result = evaluate(
-            test_cases=[tc],
-            metrics=metrics_for(case),
-            async_config=AsyncConfig(run_async=True, max_concurrent=args.max_concurrent),
-            display_config=DisplayConfig(print_results=False, show_indicator=False),
-        )
+        try:
+            with eval_case_span(case.id, case.category, case.subcategory, case.inputs):
+                rec = recommender.recommend(**case.inputs)
+                tc = LLMTestCase(input=rec.input, actual_output=rec.output)
+                result = evaluate(
+                    test_cases=[tc],
+                    metrics=metrics_for(case),
+                    async_config=AsyncConfig(run_async=True, max_concurrent=args.max_concurrent),
+                    display_config=DisplayConfig(print_results=False, show_indicator=False),
+                )
+        except Exception as e:
+            # One bad case shouldn't waste a 400-request run. Record and continue.
+            print(f"       ! {case.id} errored: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            errored.append((case, f"{type(e).__name__}: {e}"))
+            continue
         for r in result.test_results:
             per_case.append((case, r))
+            for m in r.metrics_data:
+                annotations.record(
+                    span_id=rec.span_id,
+                    case_id=case.id,
+                    metric_name=m.name,
+                    score=m.score,
+                    success=m.success,
+                    explanation=getattr(m, "reason", None) or getattr(m, "explanation", None),
+                )
 
     # ---- aggregate ----
     total = len(per_case)
@@ -110,7 +146,10 @@ def run(args: argparse.Namespace) -> int:
             if m.success:
                 per_metric[name][0] += 1
 
-    print(f"\nOverall: {passed}/{total} ({passed / total:.0%})")
+    if total:
+        print(f"\nOverall: {passed}/{total} ({passed / total:.0%})")
+    else:
+        print("\nOverall: no cases produced results")
 
     print("\nPer-metric pass rate:")
     for name, (p, t) in sorted(per_metric.items()):
@@ -120,6 +159,11 @@ def run(args: argparse.Namespace) -> int:
     for name, (p, t) in sorted(per_category.items()):
         print(f"  {name:<25s} {p:>3d}/{t:<3d} ({p / t:.0%})")
 
+    if errored:
+        print(f"\nErrored: {len(errored)} case(s) skipped:")
+        for case, msg in errored:
+            print(f"  {case.id:<10} {msg}")
+
     # ---- snapshot ----
     if args.json:
         snapshot = {
@@ -127,7 +171,8 @@ def run(args: argparse.Namespace) -> int:
             "recommender_model": recommender.model,
             "case_count": total,
             "passed": passed,
-            "pass_rate": passed / total,
+            "pass_rate": (passed / total) if total else 0.0,
+            "errored": [{"id": case.id, "error": msg} for case, msg in errored],
             "per_metric": {
                 name: {"passed": p, "total": t, "rate": p / t}
                 for name, (p, t) in per_metric.items()
@@ -153,7 +198,14 @@ def run(args: argparse.Namespace) -> int:
         args.json.write_text(json.dumps(snapshot, indent=2))
         print(f"\nSnapshot written to {args.json}")
 
-    return 0 if passed == total else 1
+    if annotations.enabled():
+        uploaded = annotations.flush()
+        if uploaded:
+            print(f"\nUploaded {uploaded} span annotations to Phoenix.")
+
+    if errored or passed != total:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
