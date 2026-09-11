@@ -5,6 +5,15 @@
 > — read it top-to-bottom for the full journey, or jump to a section for a
 > specific pattern.
 
+> **Scope note.** This tutorial covers the **DeepEval evaluation harness**
+> — the golden dataset, the rubric, the pytest suite. The recommender has
+> since grown a tool loop over a movie catalog and gained a FastAPI
+> surface, and everything is now traced with Arize Phoenix over
+> OpenTelemetry. For the tracing side of the project, see
+> [TRACING.md](TRACING.md); for how to run each piece, see
+> [README.md](README.md). The DeepEval design rationale below is still
+> current.
+
 ## Table of contents
 
 0. [Concepts you need first](#0-concepts-you-need-first)
@@ -135,22 +144,28 @@ about which metrics we could use.
 
 ```
 .
-├── src/recommender/       # System under test — Claude-powered recommender
-│   ├── agent.py           #   MovieRecommender.recommend(...)
-│   └── prompts.py         #   System + user prompt templates
+├── src/
+│   ├── recommender/       # System under test — Claude-powered agent
+│   │   ├── agent.py       #   MovieRecommender.recommend(...) + tool loop
+│   │   ├── prompts.py     #   System + user prompt templates
+│   │   ├── tools.py       #   Anthropic tool schemas + dispatcher
+│   │   └── catalog.py     #   In-memory movie catalog
+│   ├── tracing/           # Phoenix / OTel setup — see TRACING.md
+│   └── server/            # FastAPI surface for the recommender
 ├── evaluation/            # Evaluation spec (not test runner)
 │   ├── datasets.py        #   Golden cases (normal / edge / failure)
 │   └── metrics.py         #   Judge model + metric configuration
 ├── tests/
 │   └── test_recommender.py  # pytest harness — imports from evaluation/
+├── conftest.py            # Calls setup_tracing() before tests
 ├── main.py                # Manual demo entry point
 └── pyproject.toml
 ```
 
-**Why three layers, not two.** A common mistake is to put metric
-configuration inside the test file. Then a script, notebook, or CI job
-that wants to re-run the same evaluation without pytest ends up
-copy-pasting the metrics. We split it:
+**Why three layers, not two** *(for the eval side)*. A common mistake
+is to put metric configuration inside the test file. Then a script,
+notebook, or CI job that wants to re-run the same evaluation without
+pytest ends up copy-pasting the metrics. We split it:
 
 - `src/recommender/` — the thing being evaluated.
 - `evaluation/` — the **spec**: goldens + metrics. Reusable from
@@ -159,20 +174,27 @@ copy-pasting the metrics. We split it:
   `evaluation/` and turns it into pass/fail per case.
 
 Because `evaluation/` sits at the repo root rather than under `src/`,
-we widen setuptools' package discovery in `pyproject.toml`:
+we widen setuptools' package discovery in `pyproject.toml` to cover
+both roots plus the `tracing/` and `server/` packages under `src/`:
 
 ```toml
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["recommender*", "evaluation*"]
+include = ["recommender*", "evaluation*", "tracing*", "server*"]
 ```
 
 ---
 
 ## 3. The system under test
 
-The recommender is deliberately simple: one method, `recommend(...)`,
-takes free-form preferences and returns three numbered picks.
+The recommender exposes one method, `recommend(...)`, that takes
+free-form preferences and returns three numbered picks. Under the hood
+it now runs an Anthropic **tool loop** — Claude calls `search_movies`
+and `get_movie_details` against a small catalog and terminates by
+calling `submit_recommendations` (see `src/recommender/tools.py` and
+[TRACING.md §2](TRACING.md#the-trace-tree-we-build) for the resulting
+span shape). The `recommend(...)` contract is unchanged: caller passes
+preferences, gets a formatted three-line string back.
 
 ```python
 # src/recommender/agent.py
@@ -403,10 +425,17 @@ dataset = EvaluationDataset(
 @pytest.mark.parametrize("golden", dataset.goldens, ids=[c.id for c in GOLDEN_DATASET])
 def test_movie_agent(golden: Golden):
     case: GoldenCase = golden.additional_metadata["case"]
-    result = recommender.recommend(**case.inputs)
-    test_case = LLMTestCase(input=result.input, actual_output=result.output)
-    assert_test(test_case, metrics_for(case))
+    with eval_case_span(case.id, case.category, case.subcategory, case.inputs):
+        result = recommender.recommend(**case.inputs)
+        test_case = LLMTestCase(input=result.input, actual_output=result.output)
+        assert_test(test_case, metrics_for(case))
 ```
+
+The `eval_case_span(...)` wrapper is a no-op when tracing is off; when
+`PHOENIX_ENABLED=1` it opens a CHAIN span that parents the
+recommender's LLM/tool spans and any judge calls, so a failing golden
+in the Phoenix UI links straight to the trace that produced it (see
+[TRACING.md](TRACING.md)).
 
 Two patterns worth calling out:
 
@@ -488,13 +517,24 @@ This POC wires up both:
 
 ### Files in this repo
 
-- `src/recommender/agent.py` — dual-provider client + `MovieRecommender.recommend()`
+Eval side (covered here):
+
+- `src/recommender/agent.py` — dual-provider client + tool loop + `MovieRecommender.recommend()`
 - `src/recommender/prompts.py` — system prompt + user prompt builder
+- `src/recommender/tools.py` — Anthropic tool schemas + OpenInference-instrumented dispatcher
+- `src/recommender/catalog.py` — in-memory movie catalog
 - `evaluation/datasets.py` — 58 goldens, three buckets, invariant assertions
 - `evaluation/metrics.py` — judge model, all metrics, `metrics_for(case)`
 - `evaluation/__init__.py` — public re-exports
 - `tests/test_recommender.py` — parametrized pytest suite
 - `scripts/run_evaluation.py` — aggregate `evaluate()` runner with `--json` snapshotting
 - `scripts/compare_snapshots.py` — diffs two snapshots, flags regressions
-- `pyproject.toml` — package discovery, dev deps
+- `conftest.py` — calls `setup_tracing()` before pytest collection
+- `pyproject.toml` — package discovery, dev/tracing/server extras
 - `main.py` — manual demo entry point
+
+Tracing + server side (covered in [TRACING.md](TRACING.md)):
+
+- `src/tracing/__init__.py` — `setup_tracing()`, `eval_case_span()`
+- `src/tracing/annotations.py` — DeepEval scores → Phoenix span annotations
+- `src/server/app.py` — FastAPI `/recommend` endpoint with session/user metadata

@@ -159,15 +159,40 @@ case regressed — safe to gate CI on.
 
 ## Phoenix tracing
 
-Turn tracing on by exporting `PHOENIX_ENABLED=1` and (usually) running
-Phoenix locally on port 6006:
+### How it works
+
+Phoenix is an **OTLP receiver** — it speaks standard OpenTelemetry over
+the wire. In this project, OpenTelemetry does all the plumbing (creates
+spans, batches them, ships them via HTTP); Phoenix stores, indexes, and
+renders them. Concretely: `phoenix.otel.register(...)` installs a
+tracer provider + batch OTLP exporter, and the OpenInference
+instrumentors for `anthropic` and `openai` monkey-patch those SDKs so
+every LLM call becomes a well-shaped LLM span for free. Everything the
+code adds by hand (the `recommend` CHAIN span, per-`tool.*` TOOL
+spans, `eval_case:<id>` wrappers) nests underneath.
+
+### Turn it on
 
 ```bash
+export PHOENIX_ENABLED=1
 pip install arize-phoenix          # if you want the local UI too
 phoenix serve                      # http://127.0.0.1:6006
 ```
 
-Once on, every recommender call produces a trace shaped like:
+`PHOENIX_ENABLED` is the master switch — everything in `src/tracing/`
+is a no-op when it's unset, and the `[tracing]` extras are only
+required when tracing is actually enabled, so pytest and the demo run
+without them.
+
+| Env var                      | Default                              | Purpose |
+|------------------------------|--------------------------------------|---------|
+| `PHOENIX_ENABLED`            | unset (off)                          | Master switch. `1` = enable. |
+| `PHOENIX_COLLECTOR_ENDPOINT` | `http://127.0.0.1:6006/v1/traces`    | OTLP endpoint. Point at Phoenix Cloud or a shared collector. |
+| `PHOENIX_SAMPLE_RATIO`       | unset (100%)                         | Parent-based sampling ratio. Lower this in production. |
+
+### What a trace looks like
+
+Every recommender call produces a trace shaped like:
 
 ```
 recommend                                    (CHAIN)
@@ -184,13 +209,24 @@ additionally wrapped in an `eval_case:<id>` chain span carrying
 `case.id`, `case.category`, and `case.subcategory` attributes, and any
 judge LLM calls (`openai/gpt-4o-mini`) nest under the same parent — so
 one failing golden links to exactly the LLM + tool + judge spans that
-produced it. DeepEval per-metric scores/labels/explanations are then
-uploaded as span annotations (`rubric`, `Answer Relevancy`, etc.) via
-`src/tracing/annotations.py`.
+produced it. Under the FastAPI surface, an HTTP SERVER span is the
+outermost parent, and `using_session` / `using_user` / `using_metadata`
+attach the request's session/user/tenant IDs to every span inside.
 
-Everything in `src/tracing/` is a no-op when `PHOENIX_ENABLED != 1`,
-and the `tracing` extras are only required when tracing is actually
-enabled — so pytest and the demo work without them.
+### Annotations (DeepEval scores → spans)
+
+Because DeepEval scores arrive **after** the recommender span closes,
+they're pushed onto their originating spans as Phoenix **annotations**
+(not attributes) via `src/tracing/annotations.py`. `record(...)` buffers
+one row per (metric, case) at scoring time, and `flush()` uploads one
+DataFrame per metric via `phoenix.client.Client().spans.log_span_annotations_dataframe(...)`.
+In the UI each recommender span then shows entries like
+`rubric: score=0.42 label=fail` inline and becomes filterable
+(e.g. `rubric.score < 0.7`).
+
+For the full walkthrough — pipeline diagram, semantic-convention
+attributes, request-scoped metadata, and the annotation flow — see
+[TRACING.md](TRACING.md).
 
 ## Extending
 
